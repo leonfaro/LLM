@@ -44,17 +44,17 @@ class SegmentConfig:
     """Lightweight energy VAD used before HTTP transcription."""
 
     # Calibrate on startup
-    energy_calibration_ms: int = 1200
-    energy_floor_dbfs: float = -60.0
+    energy_calibration_ms: int = 3000
+    energy_floor_dbfs: float = -50.0
 
     # Tighter gate → fewer false positives
     energy_offset_db: float = 12.0
 
     # Segment shaping
-    min_speech_ms: int = 400
-    max_silence_ms: int = 300
+    min_speech_ms: int = 300
+    max_silence_ms: int = 200
     max_segment_seconds: float = 5.0
-    pre_roll_ms: int = 220
+    pre_roll_ms: int = 120
 
     @classmethod
     def from_env(cls) -> "SegmentConfig":
@@ -100,4 +100,3 @@ class HTTPSTTConfig:
 
 def load_http_stt_config() -> HTTPSTTConfig:
     return HTTPSTTConfig.from_env()
-

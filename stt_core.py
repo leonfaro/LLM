@@ -5,17 +5,15 @@ import json
 import logging
 import os
 import queue
-import re
 import shutil
 import subprocess
 import threading
 import time
-import unicodedata
 import wave
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 import numpy as np
@@ -77,99 +75,6 @@ FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000  # 160 samples @16 kHz, 10 ms fra
 
 WAV_DUMP_ROOT = Path("/tmp")
 WAV_DUMP_PREFIX = "dual_stt"
-
-_ASCII_STRIP_RE = re.compile(r"[^\x00-\x7F]+")
-_WHITESPACE_RE = re.compile(r"\s+")
-
-
-def force_english_text(text: str) -> str:
-    """Normalize text to ASCII-only English-friendly output."""
-    if not text:
-        return ""
-    normalized = unicodedata.normalize("NFKD", str(text))
-    ascii_only = _ASCII_STRIP_RE.sub(" ", normalized)
-    collapsed = _WHITESPACE_RE.sub(" ", ascii_only).strip()
-    return collapsed
-
-
-def _load_wordlist() -> Set[str]:
-    candidates = [
-        Path("/usr/share/dict/words"),
-        Path("/usr/share/dict/web2"),
-    ]
-    words: Set[str] = set()
-    for path in candidates:
-        if not path.exists():
-            continue
-        try:
-            with path.open("r", encoding="utf-8", errors="ignore") as handle:
-                for line in handle:
-                    w = line.strip().lower()
-                    if not w:
-                        continue
-                    if all(("a" <= ch <= "z") or ch in {"'", "-"} for ch in w):
-                        words.add(w.replace("-", ""))
-        except Exception:
-            continue
-    if not words:
-        words.update(
-            {
-                "the",
-                "and",
-                "for",
-                "with",
-                "that",
-                "this",
-                "which",
-                "from",
-                "model",
-                "risk",
-                "return",
-                "portfolio",
-                "factor",
-                "market",
-                "because",
-                "therefore",
-                "might",
-                "could",
-                "would",
-                "should",
-            }
-        )
-    return words
-
-
-EN_WORDS: Set[str] = _load_wordlist()
-
-
-def is_probably_english(text: str) -> bool:
-    tokens: List[str] = []
-    for word in text.split():
-        cleaned = re.sub(r"[^a-z']", "", word.lower()).strip("'")
-        if cleaned:
-            tokens.append(cleaned)
-    if not tokens:
-        return False
-    if EN_WORDS:
-        hits = 0
-        for token in tokens:
-            base = token
-            if base.endswith("'s"):
-                base = base[:-2]
-            if base in EN_WORDS or (base.endswith("s") and base[:-1] in EN_WORDS):
-                hits += 1
-        if hits == 0:
-            return False
-        return hits >= 2 or hits / len(tokens) >= 0.4
-
-    alpha = sum(1 for c in text if c.isalpha())
-    if alpha == 0:
-        return False
-    ascii_ratio = alpha / max(1, len(text))
-    if ascii_ratio < 0.85:
-        return False
-    vowels = sum(1 for c in text.lower() if c in "aeiou")
-    return vowels / alpha >= 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +522,13 @@ class EnergySegmenter:
             self._started_frames += 1
             if is_speech:
                 self._silence_frames = 0
+                if self._started_frames >= self._max_segment_frames:
+                    if self._started_frames >= self._min_speech_frames:
+                        segments.append(b"".join(self._segment_frames))
+                    self._segment_frames.clear()
+                    self._speaking = False
+                    self._silence_frames = 0
+                    self._started_frames = 0
             else:
                 self._silence_frames += 1
                 if self._silence_frames >= self._max_silence_frames or self._started_frames >= self._max_segment_frames:
@@ -663,6 +575,8 @@ class HTTPTranscriber(threading.Thread):
         self._frames: "queue.Queue[bytes]" = queue.Queue(maxsize=max_queue)
         self._stop_event = threading.Event()
         self._flush_flag = threading.Event()
+        self._flush_event = threading.Event()
+        self._flush_event.set()
         self._seg = EnergySegmenter(self.cfg.segment)
         self._api_key = load_openai_api_key()
         self._seg_accum: str = ""
@@ -676,6 +590,11 @@ class HTTPTranscriber(threading.Thread):
 
     def flush_now(self) -> None:
         self._flush_flag.set()
+
+    def flush_and_wait(self, timeout: float = 1.5) -> bool:
+        self._flush_event.clear()
+        self._flush_flag.set()
+        return self._flush_event.wait(timeout)
 
     def send_frame(self, pcm16: bytes) -> None:
         if not pcm16 or self._stop_event.is_set():
@@ -703,6 +622,8 @@ class HTTPTranscriber(threading.Thread):
                 trailing = self._seg.flush()
                 if trailing:
                     self._transcribe_segment(trailing)
+                self._flush_event.set()
+                continue
             try:
                 frame = self._frames.get(timeout=0.1)
             except queue.Empty:
@@ -715,6 +636,7 @@ class HTTPTranscriber(threading.Thread):
         trailing = self._seg.flush()
         if trailing:
             self._transcribe_segment(trailing)
+        self._flush_event.set()
 
     # ---- helpers -----------------------------------------------------
 
@@ -813,7 +735,7 @@ class HTTPTranscriber(threading.Thread):
             or (message.get("data") or {}).get("text")
             or (message.get("data") or {}).get("delta")
         ) or ""
-        text = force_english_text(text)
+        text = str(text)
 
         lowered = msg_type.lower()
 
@@ -822,7 +744,7 @@ class HTTPTranscriber(threading.Thread):
                 return
             if text:
                 if self._seg_accum:
-                    self._seg_accum = force_english_text(f"{self._seg_accum} {text}")
+                    self._seg_accum = f"{self._seg_accum} {text}".strip()
                 else:
                     self._seg_accum = text
                 self.on_text(
@@ -831,9 +753,7 @@ class HTTPTranscriber(threading.Thread):
                     {"reason": "partial", "language": self.cfg.language},
                 )
         elif lowered.endswith(".completed") or lowered.endswith(".done") or lowered.endswith("completed"):
-            final_text = force_english_text(
-                text or message.get("transcript", {}).get("text") or ""
-            )
+            final_text = (text or message.get("transcript", {}).get("text") or "").strip()
             if not final_text:
                 final_text = self._seg_accum.strip()
             if final_text:
@@ -872,7 +792,7 @@ class HTTPTranscriber(threading.Thread):
                 language = detected.strip()
             final_text = self._extract_json_text(payload)
         else:
-            final_text = force_english_text(str(payload or ""))
+            final_text = str(payload or "").strip()
 
         if final_text:
             self.on_text(self.label, final_text, {"reason": "endpoint", "language": language})
@@ -915,9 +835,9 @@ class HTTPTranscriber(threading.Thread):
                 candidates.append(" ".join(parts))
 
         for candidate in candidates:
-            cleaned = force_english_text(candidate)
-            if cleaned:
-                return cleaned
+            candidate_text = str(candidate).strip()
+            if candidate_text:
+                return candidate_text
         return ""
 
 
@@ -939,6 +859,4 @@ __all__ = [
     "StreamState",
     "EnergySegmenter",
     "HTTPTranscriber",
-    "force_english_text",
-    "is_probably_english",
 ]

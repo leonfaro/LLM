@@ -42,8 +42,6 @@ from stt_core import (
     StreamState,
     EnergySegmenter,
     HTTPTranscriber,
-    force_english_text,
-    is_probably_english,
     load_openai_api_key,
 )
 
@@ -356,15 +354,53 @@ class App(tk.Tk):
         mic_model = os.environ.get("LOCAL_LLM_MIC_MODEL", mic_model_default)
         sys_segment_cfg = SegmentConfig.from_env()
         sys_base_cfg = HTTPSTTConfig.from_env(segment=sys_segment_cfg)
-        self._http_cfg_sys = replace(sys_base_cfg, model=sys_model)
+        self._http_cfg_sys = replace(sys_base_cfg, model=sys_model, language="en")
         mic_segment_cfg = SegmentConfig.from_env()
         mic_base_cfg = HTTPSTTConfig.from_env(segment=mic_segment_cfg)
         mic_streaming = mic_base_cfg.enable_delta_streaming and not mic_model.lower().startswith("whisper")
         self._http_cfg_mic = replace(
             mic_base_cfg,
             model=mic_model,
+            language="en",
             enable_delta_streaming=mic_streaming,
         )
+        # Default per-stream segment tuning
+        mic_defaults = SegmentConfig(
+            energy_calibration_ms=3000,
+            energy_floor_dbfs=-50.0,
+            energy_offset_db=12.0,
+            min_speech_ms=300,
+            max_silence_ms=200,
+            max_segment_seconds=5.0,
+            pre_roll_ms=120,
+        )
+        sys_defaults = SegmentConfig(
+            energy_calibration_ms=1200,
+            energy_floor_dbfs=-60.0,
+            energy_offset_db=0.0,
+            min_speech_ms=120,
+            max_silence_ms=120,
+            max_segment_seconds=1.0,
+            pre_roll_ms=100,
+        )
+        self._http_cfg_mic = replace(self._http_cfg_mic, segment=mic_defaults)
+        self._http_cfg_sys = replace(self._http_cfg_sys, segment=sys_defaults)
+        # Editable segment parameters tracked per stream
+        def _segment_vars_from_cfg(cfg: SegmentConfig) -> Dict[str, tk.StringVar]:
+            return {
+                "energy_calibration_ms": tk.StringVar(value=str(cfg.energy_calibration_ms)),
+                "energy_floor_dbfs": tk.StringVar(value=str(cfg.energy_floor_dbfs)),
+                "energy_offset_db": tk.StringVar(value=str(cfg.energy_offset_db)),
+                "min_speech_ms": tk.StringVar(value=str(cfg.min_speech_ms)),
+                "max_silence_ms": tk.StringVar(value=str(cfg.max_silence_ms)),
+                "max_segment_seconds": tk.StringVar(value=str(cfg.max_segment_seconds)),
+                "pre_roll_ms": tk.StringVar(value=str(cfg.pre_roll_ms)),
+            }
+
+        self._segment_vars: Dict[str, Dict[str, tk.StringVar]] = {
+            "mic": _segment_vars_from_cfg(self._http_cfg_mic.segment),
+            "sys": _segment_vars_from_cfg(self._http_cfg_sys.segment),
+        }
 
         self.monitor_var = tk.StringVar()
         self.monitor_combo: Optional[ttk.Combobox] = None
@@ -403,6 +439,7 @@ class App(tk.Tk):
         ttk.Label(devices_frame, text="Monitor output").grid(row=4, column=0, sticky="w", pady=(6, 0))
         self.monitor_combo = ttk.Combobox(devices_frame, width=38, textvariable=self.monitor_var, state="readonly")
         self.monitor_combo.grid(row=5, column=0, sticky="we")
+        self.monitor_combo.bind("<<ComboboxSelected>>", self._on_monitor_selected)
 
         devices_frame.grid_columnconfigure(0, weight=1)
 
@@ -423,6 +460,29 @@ class App(tk.Tk):
             command=self._on_capture_toggle,
         )
         sys_off.grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        gate_frame = ttk.LabelFrame(parent, text="Energy Gate")
+        gate_frame.pack(fill=tk.X, pady=(0, 6))
+        gate_frame.columnconfigure(1, weight=1)
+        gate_frame.columnconfigure(2, weight=1)
+        ttk.Label(gate_frame, text="Parameter").grid(row=0, column=0, sticky="w")
+        ttk.Label(gate_frame, text="Input (Mic)").grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(gate_frame, text="Output (System)").grid(row=0, column=2, sticky="w", padx=(8, 0))
+        energy_fields = [
+            ("Calibration (ms)", "energy_calibration_ms"),
+            ("Floor (dBFS)", "energy_floor_dbfs"),
+            ("Offset (dB)", "energy_offset_db"),
+            ("Min speech (ms)", "min_speech_ms"),
+            ("Max silence (ms)", "max_silence_ms"),
+            ("Max segment (s)", "max_segment_seconds"),
+            ("Pre-roll (ms)", "pre_roll_ms"),
+        ]
+        for row, (label, key) in enumerate(energy_fields, start=1):
+            ttk.Label(gate_frame, text=label).grid(row=row, column=0, sticky="w", pady=(0, 2))
+            mic_entry = ttk.Entry(gate_frame, textvariable=self._segment_vars["mic"][key], width=10)
+            mic_entry.grid(row=row, column=1, sticky="we", padx=(8, 4), pady=(0, 2))
+            sys_entry = ttk.Entry(gate_frame, textvariable=self._segment_vars["sys"][key], width=10)
+            sys_entry.grid(row=row, column=2, sticky="we", padx=(8, 0), pady=(0, 2))
 
         btn_frame = ttk.Frame(parent)
         btn_frame.pack(fill=tk.X, pady=(6, 0))
@@ -493,10 +553,13 @@ class App(tk.Tk):
         agents_frame.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
         agents_frame.columnconfigure(0, weight=1)
         agents_frame.columnconfigure(1, weight=1)
+        agents_frame.rowconfigure(1, weight=1)
+        ttk.Label(agents_frame, text="Agent1 Response", anchor="w").grid(row=0, column=0, sticky="w")
+        ttk.Label(agents_frame, text="Agent2 Response", anchor="w").grid(row=0, column=1, sticky="w")
         a1 = ScrolledText(agents_frame, wrap="word", height=4)
-        a1.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
+        a1.grid(row=1, column=0, sticky="nsew", padx=(0, 2))
         a2 = ScrolledText(agents_frame, wrap="word", height=4)
-        a2.grid(row=0, column=1, sticky="nsew", padx=(2, 0))
+        a2.grid(row=1, column=1, sticky="nsew", padx=(2, 0))
         self.agent1_stage_box = a1
         self.agent2_stage_box = a2
         self._write_text(a1, "", newline=False)
@@ -523,6 +586,62 @@ class App(tk.Tk):
         send_btn = ttk.Button(input_frame, text="Send", command=self._send_agent_message)
         send_btn.grid(row=1, column=1, sticky="e", padx=(6, 0), pady=(6, 0))
         self.agent_send_button = send_btn
+
+    def _apply_segment_settings(self) -> None:
+        vars_map = getattr(self, "_segment_vars", None)
+        if not vars_map:
+            return
+
+        field_specs = [
+            ("energy_calibration_ms", int, 0),
+            ("energy_floor_dbfs", float, None),
+            ("energy_offset_db", float, None),
+            ("min_speech_ms", int, 0),
+            ("max_silence_ms", int, 0),
+            ("max_segment_seconds", float, 0.1),
+            ("pre_roll_ms", int, 0),
+        ]
+
+        def _build_segment(var_dict: Dict[str, tk.StringVar], current: SegmentConfig) -> SegmentConfig:
+            cleaned: Dict[str, object] = {}
+            for key, caster, min_value in field_specs:
+                current_default = getattr(current, key)
+                var = var_dict.get(key)
+                if var is None:
+                    cleaned[key] = current_default
+                    continue
+                raw = var.get().strip()
+                if not raw:
+                    value = current_default
+                else:
+                    try:
+                        value = caster(raw)
+                    except (ValueError, TypeError):
+                        value = current_default
+                if isinstance(value, (int, float)) and min_value is not None and value < min_value:
+                    value = caster(min_value)
+                if isinstance(value, int) and value < 0:
+                    value = 0
+                var.set(str(value))
+                cleaned[key] = value
+
+            return SegmentConfig(
+                energy_calibration_ms=int(cleaned.get("energy_calibration_ms", current.energy_calibration_ms)),
+                energy_floor_dbfs=float(cleaned.get("energy_floor_dbfs", current.energy_floor_dbfs)),
+                energy_offset_db=float(cleaned.get("energy_offset_db", current.energy_offset_db)),
+                min_speech_ms=int(cleaned.get("min_speech_ms", current.min_speech_ms)),
+                max_silence_ms=int(cleaned.get("max_silence_ms", current.max_silence_ms)),
+                max_segment_seconds=float(cleaned.get("max_segment_seconds", current.max_segment_seconds)),
+                pre_roll_ms=int(cleaned.get("pre_roll_ms", current.pre_roll_ms)),
+            )
+
+        mic_vars = vars_map.get("mic", {})
+        sys_vars = vars_map.get("sys", {})
+        mic_segment = _build_segment(mic_vars, self._http_cfg_mic.segment)
+        sys_segment = _build_segment(sys_vars, self._http_cfg_sys.segment)
+
+        self._http_cfg_mic = replace(self._http_cfg_mic, segment=mic_segment)
+        self._http_cfg_sys = replace(self._http_cfg_sys, segment=sys_segment)
 
     def _refresh_live_box(self, speaker: str):
         widget = self.live_text_widgets.get(speaker)
@@ -683,7 +802,7 @@ class App(tk.Tk):
             widget.see(tk.END)
 
     def _append_conversation_line(self, label: str, text: str) -> None:
-        cleaned = force_english_text(text or "")
+        cleaned = str(text or "").strip()
         if not cleaned:
             return
         stamp = time.strftime("%H:%M:%S", time.localtime())
@@ -812,12 +931,12 @@ class App(tk.Tk):
             key = self._segment_key(seg)
             if key in self._session_logged_keys:
                 continue
-            english_text = force_english_text(seg.text)
+            english_text = str(seg.text or "").strip()
             if not english_text:
                 self._session_logged_keys.add(key)
                 continue
             speaker = "Interviewee" if seg.label == "MIC" else "Interviewer"
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(seg.started_at))
+            timestamp = time.strftime("%H:%M:%S", time.localtime(seg.started_at))
             new_lines.append(f"[{timestamp}] {speaker}: {english_text}")
             self._session_logged_keys.add(key)
 
@@ -980,25 +1099,7 @@ class App(tk.Tk):
                     self._append_log(
                         "Unable to force system output to BlackHole 2ch automatically; please confirm manually."
                     )
-                self.sys_monitor = None
-                mon_idx = mon_channels = None
-                mon_name: Optional[str] = None
-                monitor_label = self.monitor_var.get()
-                monitor_info = self._monitor_devices.get(monitor_label)
-                if monitor_info:
-                    mon_idx, mon_name, mon_channels = monitor_info
-                else:
-                    mon_idx, mon_name, mon_channels = find_monitor_device()
-                if mon_idx is not None:
-                    try:
-                        channels = mon_channels if mon_channels is not None else 2
-                        self.sys_monitor = AudioMonitor(mon_idx, channels=channels)
-                        self.sys_monitor.start()
-                        monitor_label = mon_name or "monitor"
-                        self._append_log(f"Routing BlackHole audio to {monitor_label}")
-                    except Exception as exc:
-                        self.sys_monitor = None
-                        self._append_log(f"Failed to start monitor output {mon_name}: {exc}")
+                self._restart_monitor()
                 self.cap_sys = AudioCapture("SYS", sys_idx, self.cfg_sys, self.q, monitor=self.sys_monitor)
                 self.cap_sys.start()
                 self._append_log("System capture re-armed")
@@ -1011,6 +1112,45 @@ class App(tk.Tk):
             widget.insert(tk.END, text + suffix)
         widget.see(tk.END)
         widget.configure(state=tk.DISABLED)
+
+    def _monitor_selection(self) -> Tuple[Optional[int], Optional[str], Optional[int]]:
+        selection = self.monitor_var.get()
+        info = self._monitor_devices.get(selection)
+        if info:
+            return info
+        return find_monitor_device()
+
+    def _restart_monitor(self) -> None:
+        if self.sys_monitor is not None:
+            try:
+                self.sys_monitor.stop()
+            except Exception:
+                pass
+            self.sys_monitor = None
+
+        mon_idx, mon_name, mon_channels = self._monitor_selection()
+        if mon_idx is None:
+            self._append_log("No speaker found for monitoring; system audio will stay on BlackHole")
+            return
+
+        try:
+            channels = mon_channels if mon_channels is not None else 2
+            self.sys_monitor = AudioMonitor(mon_idx, channels=channels)
+            self.sys_monitor.start()
+            label = mon_name or "monitor"
+            self._append_log(f"Routing BlackHole audio to {label}")
+            if self.cap_sys is not None:
+                self.cap_sys.monitor = self.sys_monitor
+        except Exception as exc:
+            self.sys_monitor = None
+            self._append_log(f"Failed to start monitor output {mon_name}: {exc}")
+
+    def _on_monitor_selected(self, _event=None):
+        selection = self.monitor_var.get()
+        if selection:
+            self._append_log(f"Monitor output set to {selection}")
+        if self.cap_sys and not self.disable_sys.get():
+            self._restart_monitor()
 
     def _run_agent_async(self, transcript: str, screenshots: Optional[List[str]] = None) -> None:
         transcript = (transcript or "").strip()
@@ -1026,15 +1166,24 @@ class App(tk.Tk):
         self._append_conversation_line("Agent status", "Agent is working…")
         if self.agent_send_button is not None:
             self.agent_send_button.configure(state=tk.DISABLED)
+        if self.agent1_stage_box is not None:
+            self._write_text(self.agent1_stage_box, "…waiting for Agent1…", newline=False)
+        if self.agent2_stage_box is not None:
+            self._write_text(self.agent2_stage_box, "…waiting for Agent2…", newline=False)
 
         def _stage_cb(stage: str, text: str) -> None:
             def _ui():
-                cleaned = force_english_text(text)
+                cleaned = str(text or "").strip()
                 if cleaned:
                     # cache latest stage output
                     self._latest_stage_outputs[stage] = cleaned
                     # show it immediately in the dedicated box
-                    widget = self.agent1_stage_box if stage == "Agent1" else self.agent2_stage_box if stage == "Agent2" else None
+                    if stage == "Agent1":
+                        widget = self.agent1_stage_box
+                    elif stage == "Agent2":
+                        widget = self.agent2_stage_box
+                    else:
+                        widget = None
                     if widget is not None:
                         widget.configure(state=tk.NORMAL)
                         widget.delete("1.0", tk.END)
@@ -1083,10 +1232,10 @@ class App(tk.Tk):
         if isinstance(result, dict):
             if not a1:
                 raw1 = result.get("agent1_output")
-                a1 = force_english_text(raw1) if isinstance(raw1, str) else ""
+                a1 = str(raw1).strip() if isinstance(raw1, str) else ""
             if not a2:
                 raw2 = result.get("agent2_output") or result.get("output_text")
-                a2 = force_english_text(raw2) if isinstance(raw2, str) else ""
+                a2 = str(raw2).strip() if isinstance(raw2, str) else ""
 
         if a1:
             self._append_conversation_line("Agent1", a1)
@@ -1096,14 +1245,12 @@ class App(tk.Tk):
             self._append_conversation_line("Agent", "Agent returned no content.")
             self._append_log("Agent response empty")
             return
-        # Clear stage boxes and cache
-        for widget in (self.agent1_stage_box, self.agent2_stage_box):
-            if widget is not None:
-                widget.configure(state=tk.NORMAL)
-                widget.delete("1.0", tk.END)
-                widget.configure(state=tk.DISABLED)
-        self._latest_stage_outputs["Agent1"] = ""
-        self._latest_stage_outputs["Agent2"] = ""
+        # Ensure the stage boxes show final outputs
+        if a1 and self.agent1_stage_box is not None:
+            self._write_text(self.agent1_stage_box, a1, newline=False)
+        if a2 and self.agent2_stage_box is not None:
+            self._write_text(self.agent2_stage_box, a2, newline=False)
+        self._latest_stage_outputs["Agent2"] = a2
         self._append_log("Agent responses appended to Conversation")
 
     def _handle_agent_failure(self, exc: Exception) -> None:
@@ -1119,14 +1266,24 @@ class App(tk.Tk):
         if self.agent_entry is not None:
             self.agent_entry.focus_set()
 
-    def _collect_transcript_lines(self, include_partials: bool = True) -> List[str]:
-        segments = sorted(self._merged_segments, key=lambda seg: seg.started_at)
+    def _collect_transcript_lines(
+        self,
+        include_partials: bool = True,
+        window_seconds: int = 120,
+        max_lines: int = 120,
+    ) -> List[str]:
+        window_seconds = max(5, int(window_seconds))
+        cutoff = time.time() - window_seconds
+        segments = sorted(
+            (seg for seg in self._merged_segments if seg.started_at >= cutoff),
+            key=lambda seg: seg.started_at,
+        )
         lines: List[str] = []
         for seg in segments:
             text = (seg.text or "").strip()
             if not text:
                 continue
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(seg.started_at))
+            timestamp = time.strftime("%H:%M:%S", time.localtime(seg.started_at))
             lines.append(f"[{timestamp}] {seg.speaker}: {text}")
         if include_partials:
             for speaker, raw in self._speaker_partial.items():
@@ -1135,23 +1292,62 @@ class App(tk.Tk):
                     continue
                 cleaned = re.sub(r"^\[\d{2}:\d{2}:\d{2}\]\s+", "", raw).rstrip(" …")
                 if cleaned:
-                    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                    timestamp = time.strftime("%H:%M:%S")
                     lines.append(f"[{timestamp}] {speaker}: {cleaned}")
+        if len(lines) > max_lines:
+            keep = max(1, int(max_lines))
+            lines = lines[-keep:]
         return lines
 
     def _dispatch_agent_request(self) -> None:
         try:
+            waited = False
+            flush_raw = os.environ.get("LOCAL_LLM_STT_FLUSH_TIMEOUT_MS", "500")
+            try:
+                flush_ms = int(flush_raw)
+            except ValueError:
+                flush_ms = 500
+            flush_sec = max(0, min(2000, flush_ms)) / 1000.0
             if self.tx_mic:
-                self.tx_mic.flush_now()
+                if getattr(self.tx_mic, "flush_and_wait", None):
+                    if self.tx_mic.flush_and_wait(timeout=flush_sec):
+                        waited = True
+                else:
+                    self.tx_mic.flush_now()
             if self.tx_sys:
-                self.tx_sys.flush_now()
+                if getattr(self.tx_sys, "flush_and_wait", None):
+                    if self.tx_sys.flush_and_wait(timeout=flush_sec):
+                        waited = True
+                else:
+                    self.tx_sys.flush_now()
         except Exception:
             pass
+        if waited:
+            try:
+                self.update_idletasks()
+                self.update()
+            except Exception:
+                pass
         wait_ms = int(os.environ.get("LOCAL_LLM_SEND_COALESCE_MS", "0"))
         if wait_ms > 0:
             time.sleep(min(500, max(0, wait_ms)) / 1000.0)
 
-        transcript_lines = self._collect_transcript_lines(include_partials=True)
+        win_s_raw = os.environ.get("LOCAL_LLM_TRANSCRIPT_WINDOW_S", "120")
+        max_lines_raw = os.environ.get("LOCAL_LLM_TRANSCRIPT_MAX_LINES", "120")
+        try:
+            win_s = int(win_s_raw)
+        except ValueError:
+            win_s = 120
+        try:
+            max_lines = int(max_lines_raw)
+        except ValueError:
+            max_lines = 120
+
+        transcript_lines = self._collect_transcript_lines(
+            include_partials=True,
+            window_seconds=win_s,
+            max_lines=max_lines,
+        )
         manual_notes = list(self.pending_manual_notes)
         screenshot_paths = list(self.pending_screenshots)
 
@@ -1280,6 +1476,7 @@ class App(tk.Tk):
             self._calibration_after_id = None
 
     def toggle_listen(self):
+        self._apply_segment_settings()
         if any((self.cap_mic, self.cap_sys, self.tx_mic, self.tx_sys, self._frame_dispatch_thread)):
             self.stop_all()
             return
@@ -1499,19 +1696,19 @@ class App(tk.Tk):
         self._ensure_stream_state(label)
         state = self._stream_state[label]
         speaker = state.speaker
-        now = time.monotonic()
-        candidate = force_english_text(text or "")
-        is_english = is_probably_english(candidate) if candidate else False
+        now = time.time()
+        candidate = str(text or "")
+        candidate_stripped = candidate.strip()
 
         if reason == "partial":
-            if not is_english:
+            if not candidate_stripped:
                 self._speaker_partial[speaker] = ""
                 return None
             if state.current_start is None:
                 state.current_start = now
             state.last_update = now
             stamp = time.strftime("%H:%M:%S", time.localtime())
-            self._speaker_partial[speaker] = f"[{stamp}] {candidate} …"
+            self._speaker_partial[speaker] = f"[{stamp}] {candidate_stripped} …"
             return None
 
         if reason == "too_short_dropped":
@@ -1520,13 +1717,7 @@ class App(tk.Tk):
             self._speaker_partial[speaker] = ""
             return None
 
-        if not candidate:
-            state.current_start = None
-            state.last_update = now
-            self._speaker_partial[speaker] = ""
-            return None
-
-        if not is_english:
+        if not candidate_stripped:
             state.current_start = None
             state.last_update = now
             self._speaker_partial[speaker] = ""
@@ -1551,7 +1742,7 @@ class App(tk.Tk):
         segment = TimedSegment(
             label=label,
             speaker=speaker,
-            text=candidate,
+            text=candidate_stripped,
             started_at=started_at,
             ended_at=now,
             reason=reason,
@@ -1560,7 +1751,7 @@ class App(tk.Tk):
         state.current_start = None
         state.last_update = now
         stamp = time.strftime("%H:%M:%S", time.localtime())
-        self._speaker_history.setdefault(speaker, []).append(f"[{stamp}] {candidate}")
+        self._speaker_history.setdefault(speaker, []).append(f"[{stamp}] {candidate_stripped}")
         self._speaker_partial[speaker] = ""
         if speaker not in self._speaker_segments:
             self._speaker_segments[speaker] = deque(maxlen=self._speaker_segment_maxlen)
