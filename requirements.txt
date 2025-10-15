@@ -1,0 +1,7 @@
+numpy
+sounddevice
+mss
+httpx
+openai>=1.107.1,<2
+openai-agents
+pydantic>=2,<3
