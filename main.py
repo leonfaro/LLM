@@ -19,7 +19,6 @@ from pathlib import Path
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple
-import re
 
 from agents import OpenAIConversationsSession
 from agent_workflow import WorkflowInput, run_workflow
@@ -296,7 +295,7 @@ class App(tk.Tk):
 
         self.cfg_mic = CaptureConfig()
         self.cfg_sys = CaptureConfig()
-        self._queue_maxsize = 16
+        self._queue_maxsize = 64
         self.q: Optional[queue.Queue] = None
         self.tx_mic: Optional[HTTPTranscriber] = None
         self.tx_sys: Optional[HTTPTranscriber] = None
@@ -320,7 +319,11 @@ class App(tk.Tk):
             label: StreamState(speaker=speaker) for label, speaker in self._speaker_alias.items()
         }
         self._speaker_live_text: Dict[str, str] = {alias: "" for alias in self._speaker_alias.values()}
-        self._speaker_history: Dict[str, List[str]] = {alias: [] for alias in self._speaker_alias.values()}
+        # history: bounded ring buffer to cap RAM
+        self._speaker_history_maxlen = int(os.environ.get("LOCAL_LLM_LIVE_HISTORY_MAXLINES", "400"))
+        self._speaker_history: Dict[str, Deque[str]] = {
+            alias: deque(maxlen=self._speaker_history_maxlen) for alias in self._speaker_alias.values()
+        }
         self._speaker_partial: Dict[str, str] = {alias: "" for alias in self._speaker_alias.values()}
         self._speaker_segments: Dict[str, Deque[TimedSegment]] = {
             alias: deque(maxlen=self._speaker_segment_maxlen) for alias in self._speaker_alias.values()
@@ -647,17 +650,50 @@ class App(tk.Tk):
         widget = self.live_text_widgets.get(speaker)
         if widget is None:
             return
+
         history = self._speaker_history.get(speaker, [])
         partial = self._speaker_partial.get(speaker, "")
-        lines = list(history)
+
+        # Build new logical line list (bounded by deque maxlen)
+        new_lines = list(history)
         if partial:
-            lines.append(partial)
+            new_lines.append(partial)
+
+        old_text = self._speaker_live_text.get(speaker, "")
+        old_lines = old_text.splitlines() if old_text else []
+
+        # Nothing to do if identical
+        if new_lines == old_lines:
+            return
+
         widget.configure(state=tk.NORMAL)
-        widget.delete("1.0", tk.END)
-        if lines:
-            widget.insert(tk.END, "\n".join(lines))
+
+        # Case 1: we only appended lines (fast-path)
+        if len(new_lines) >= len(old_lines) and new_lines[: len(old_lines)] == old_lines:
+            suffix = "\n".join(new_lines[len(old_lines):])
+            if suffix:
+                if old_lines:
+                    widget.insert(tk.END, "\n" + suffix)
+                else:
+                    widget.insert(tk.END, suffix)
+
+        # Case 2: same line count, last line updated (typical partial update)
+        elif len(new_lines) == len(old_lines) and new_lines[:-1] == old_lines[:-1]:
+            widget.delete("end-1l linestart", "end")
+            if len(new_lines) > 1:
+                widget.insert(tk.END, "\n" + new_lines[-1])
+            else:
+                widget.insert(tk.END, new_lines[-1])
+
+        # Case 3: fallback to full rewrite (rare)
+        else:
+            widget.delete("1.0", tk.END)
+            if new_lines:
+                widget.insert(tk.END, "\n".join(new_lines))
+
         widget.see(tk.END)
         widget.configure(state=tk.DISABLED)
+        self._speaker_live_text[speaker] = "\n".join(new_lines)
 
     def _refresh_all_live_boxes(self):
         for speaker in self.live_text_widgets:
@@ -687,7 +723,7 @@ class App(tk.Tk):
         return text
 
     def _load_context_buckets(self, directory: Path) -> Dict[str, str]:
-        files = sorted({p.resolve() for p in directory.rglob("*") if p.is_file()})
+        files = sorted({p.resolve() for p in directory.rglob("*") if p.is_file() and p.name != ".DS_Store"})
         buckets = {"cv_text": [], "prior_interview_notes": [], "constraints_or_prefs": []}
         totals = {"cv_text": 0, "prior_interview_notes": 0, "constraints_or_prefs": 0}
 
@@ -743,34 +779,8 @@ class App(tk.Tk):
             f"Context loaded (cv={cv_len} chars, notes={notes_len} chars, constraints={cons_len} chars)"
         )
 
-        all_files = sorted(p for p in directory.rglob("*") if p.is_file())
-        entries: List[str] = []
-        for path in all_files:
-            text = self._read_text_file(path)
-            if not text:
-                continue
-            try:
-                rel_path = path.relative_to(directory)
-            except ValueError:
-                rel_path = path
-            cleaned = text.strip()
-            if not cleaned:
-                continue
-            entries.append(f"### {rel_path}\n{cleaned}")
-
-        if not entries:
-            self._append_log("No readable context files found to send.")
-            return
-
-        payload_sections: List[str] = [prompt_text.strip(), *entries]
-        payload_text = "\n\n".join(section for section in payload_sections if section.strip()).strip()
-        if not payload_text:
-            self._append_log("Context payload empty; nothing sent.")
-            return
-
-        self._append_log(f"Sending {len(entries)} context files to agent.")
-        self._run_agent_async(payload_text, screenshots=None)
-        self.status.set("Context sent to agent.")
+        self._append_log("Context loaded into session (not sent to LLM).")
+        self.status.set("Context ready; next replies will use it.")
 
     def _append_conversation_entry(self, segments: Sequence[TimedSegment], formatted_text: str):
         formatted_text = (formatted_text or "").strip()
@@ -805,8 +815,7 @@ class App(tk.Tk):
         cleaned = str(text or "").strip()
         if not cleaned:
             return
-        stamp = time.strftime("%H:%M:%S", time.localtime())
-        entry_line = f"[{stamp}] {label}: {cleaned}"
+        entry_line = f"{label}: {cleaned}"
         self.conversation_log.append(entry_line)
         if self.conversation_text is not None:
             widget = self.conversation_text
@@ -825,7 +834,7 @@ class App(tk.Tk):
             state = self._stream_state[label]
             state.current_start = None
             state.last_update = None
-        self._speaker_history[speaker] = []
+        self._speaker_history[speaker] = deque(maxlen=self._speaker_history_maxlen)
         self._speaker_partial[speaker] = ""
         self._merged_segments = deque(
             (seg for seg in self._merged_segments if seg.label != label),
@@ -936,8 +945,7 @@ class App(tk.Tk):
                 self._session_logged_keys.add(key)
                 continue
             speaker = "Interviewee" if seg.label == "MIC" else "Interviewer"
-            timestamp = time.strftime("%H:%M:%S", time.localtime(seg.started_at))
-            new_lines.append(f"[{timestamp}] {speaker}: {english_text}")
+            new_lines.append(f"{speaker}: {english_text}")
             self._session_logged_keys.add(key)
 
         if new_lines:
@@ -1062,8 +1070,7 @@ class App(tk.Tk):
             self.after(200, self._drain_logs)
 
     def _append_log(self, message: str):
-        stamp = time.strftime("%H:%M:%S")
-        self.log_text.insert(tk.END, f"[{stamp}] {message}\n")
+        self.log_text.insert(tk.END, f"{message}\n")
         self.log_text.see(tk.END)
 
     def _on_capture_toggle(self):
@@ -1152,7 +1159,13 @@ class App(tk.Tk):
         if self.cap_sys and not self.disable_sys.get():
             self._restart_monitor()
 
-    def _run_agent_async(self, transcript: str, screenshots: Optional[List[str]] = None) -> None:
+    def _run_agent_async(
+        self,
+        transcript: str,
+        screenshots: Optional[List[str]] = None,
+        *,
+        include_context: bool = False,
+    ) -> None:
         transcript = (transcript or "").strip()
         if not transcript:
             return
@@ -1166,10 +1179,6 @@ class App(tk.Tk):
         self._append_conversation_line("Agent status", "Agent is working…")
         if self.agent_send_button is not None:
             self.agent_send_button.configure(state=tk.DISABLED)
-        if self.agent1_stage_box is not None:
-            self._write_text(self.agent1_stage_box, "…waiting for Agent1…", newline=False)
-        if self.agent2_stage_box is not None:
-            self._write_text(self.agent2_stage_box, "…waiting for Agent2…", newline=False)
 
         def _stage_cb(stage: str, text: str) -> None:
             def _ui():
@@ -1196,15 +1205,15 @@ class App(tk.Tk):
 
         def _worker():
             try:
-                ctx = getattr(self, "session_context", {}) or {}
+                ctx = self.session_context if include_context else {}
                 result = asyncio.run(
                     run_workflow(
                         WorkflowInput(
                             input_as_text=transcript,
                             screenshots=(screenshots or []),
-                            cv_text=ctx.get("cv_text"),
-                            prior_interview_notes=ctx.get("prior_interview_notes"),
-                            constraints_or_prefs=ctx.get("constraints_or_prefs"),
+                            cv_text=ctx.get("cv_text") if ctx else None,
+                            prior_interview_notes=ctx.get("prior_interview_notes") if ctx else None,
+                            constraints_or_prefs=ctx.get("constraints_or_prefs") if ctx else None,
                         ),
                         session=self.agent_session,
                         on_stage=_stage_cb,
@@ -1266,43 +1275,74 @@ class App(tk.Tk):
         if self.agent_entry is not None:
             self.agent_entry.focus_set()
 
+    def _format_transcript_line(
+        self,
+        seg_label: Optional[str],
+        speaker_name: str,
+        text: str,
+        *,
+        normalize_for_llm: bool,
+        timestamp: Optional[float] = None,
+    ) -> str:
+        if normalize_for_llm:
+            if seg_label == "MIC":
+                speaker = "Leon"
+            elif seg_label == "SYS":
+                speaker = "Interviewer"
+            else:
+                speaker = speaker_name
+            return f"{speaker}: {text}"
+
+        ts_str = (time.strftime("%H:%M:%S", time.localtime(timestamp)) if timestamp is not None else time.strftime("%H:%M:%S"))
+        return f"[{ts_str}] {speaker_name}: {text}"
+
     def _collect_transcript_lines(
         self,
         include_partials: bool = True,
-        window_seconds: int = 120,
-        max_lines: int = 120,
+        normalize_for_llm: bool = False,
     ) -> List[str]:
-        window_seconds = max(5, int(window_seconds))
-        cutoff = time.time() - window_seconds
-        segments = sorted(
-            (seg for seg in self._merged_segments if seg.started_at >= cutoff),
-            key=lambda seg: seg.started_at,
-        )
+        segments = sorted(self._merged_segments, key=lambda seg: seg.started_at)
         lines: List[str] = []
         for seg in segments:
             text = (seg.text or "").strip()
             if not text:
                 continue
-            timestamp = time.strftime("%H:%M:%S", time.localtime(seg.started_at))
-            lines.append(f"[{timestamp}] {seg.speaker}: {text}")
+            lines.append(
+                self._format_transcript_line(
+                    seg_label=seg.label,
+                    speaker_name=seg.speaker,
+                    text=text,
+                    normalize_for_llm=normalize_for_llm,
+                    timestamp=seg.started_at,
+                )
+            )
+
         if include_partials:
-            for speaker, raw in self._speaker_partial.items():
-                raw = (raw or "").strip()
-                if not raw:
+            alias_lookup: Dict[str, str] = {alias: label for label, alias in self._speaker_alias.items()}
+            for speaker_name, raw in self._speaker_partial.items():
+                partial_text = (raw or "").strip()
+                if not partial_text:
                     continue
-                cleaned = re.sub(r"^\[\d{2}:\d{2}:\d{2}\]\s+", "", raw).rstrip(" …")
-                if cleaned:
-                    timestamp = time.strftime("%H:%M:%S")
-                    lines.append(f"[{timestamp}] {speaker}: {cleaned}")
-        if len(lines) > max_lines:
-            keep = max(1, int(max_lines))
-            lines = lines[-keep:]
+                cleaned = partial_text.rstrip(" …")
+                if not cleaned:
+                    continue
+                base_label = alias_lookup.get(speaker_name)
+                lines.append(
+                    self._format_transcript_line(
+                        seg_label=base_label,
+                        speaker_name=speaker_name,
+                        text=cleaned,
+                        normalize_for_llm=normalize_for_llm,
+                        timestamp=None,
+                    )
+                )
+
         return lines
 
     def _dispatch_agent_request(self) -> None:
         try:
             waited = False
-            flush_raw = os.environ.get("LOCAL_LLM_STT_FLUSH_TIMEOUT_MS", "500")
+            flush_raw = os.environ.get("LOCAL_LLM_STT_FLUSH_TIMEOUT_MS", "250")
             try:
                 flush_ms = int(flush_raw)
             except ValueError:
@@ -1332,22 +1372,44 @@ class App(tk.Tk):
         if wait_ms > 0:
             time.sleep(min(500, max(0, wait_ms)) / 1000.0)
 
-        win_s_raw = os.environ.get("LOCAL_LLM_TRANSCRIPT_WINDOW_S", "120")
-        max_lines_raw = os.environ.get("LOCAL_LLM_TRANSCRIPT_MAX_LINES", "120")
-        try:
-            win_s = int(win_s_raw)
-        except ValueError:
-            win_s = 120
-        try:
-            max_lines = int(max_lines_raw)
-        except ValueError:
-            max_lines = 120
+        cut_segments = [seg for seg in self._merged_segments if seg.ended_at > self._help_anchor]
+        cut_segments.sort(key=lambda seg: seg.started_at)
+        transcript_lines: List[str] = []
+        for seg in cut_segments:
+            txt = (seg.text or "").strip()
+            if not txt:
+                continue
+            transcript_lines.append(
+                self._format_transcript_line(
+                    seg_label=seg.label,
+                    speaker_name=seg.speaker,
+                    text=txt,
+                    normalize_for_llm=True,
+                    timestamp=seg.started_at,
+                )
+            )
+        if cut_segments:
+            self._help_anchor = cut_segments[-1].ended_at
 
-        transcript_lines = self._collect_transcript_lines(
-            include_partials=True,
-            window_seconds=win_s,
-            max_lines=max_lines,
-        )
+        # Include current partials so delta text is not lost
+        alias_lookup: Dict[str, str] = {alias: label for label, alias in self._speaker_alias.items()}
+        for speaker_name, raw in self._speaker_partial.items():
+            partial_text = (raw or "").strip()
+            if not partial_text:
+                continue
+            cleaned = partial_text.rstrip(" …")
+            if not cleaned:
+                continue
+            base_label = alias_lookup.get(speaker_name)
+            transcript_lines.append(
+                self._format_transcript_line(
+                    seg_label=base_label,
+                    speaker_name=speaker_name,
+                    text=cleaned,
+                    normalize_for_llm=True,
+                    timestamp=None,
+                )
+            )
         manual_notes = list(self.pending_manual_notes)
         screenshot_paths = list(self.pending_screenshots)
 
@@ -1370,7 +1432,8 @@ class App(tk.Tk):
         self._append_log(
             f"Sending to agent (segments={len(transcript_lines)}, notes={len(manual_notes)}, screenshots={len(screenshot_paths)})"
         )
-        self._run_agent_async(payload, screenshots=screenshot_paths)
+        include_context = bool(self.session_context)
+        self._run_agent_async(payload, screenshots=screenshot_paths, include_context=include_context)
 
     def _send_agent_message(self) -> None:
         if self.agent_entry is None:
@@ -1380,8 +1443,7 @@ class App(tk.Tk):
         if cleaned:
             self.agent_entry.delete("1.0", tk.END)
             self.agent_entry.focus_set()
-            stamp = time.strftime("%H:%M:%S", time.localtime())
-            entry_line = f"[{stamp}] You: {cleaned}"
+            entry_line = f"You: {cleaned}"
             self.conversation_log.append(entry_line)
             if self.conversation_text is not None:
                 widget = self.conversation_text
@@ -1444,8 +1506,7 @@ class App(tk.Tk):
         except ValueError:
             pass
 
-        stamp = time.strftime("%H:%M:%S", time.localtime())
-        note = f"[{stamp}] Screenshot captured: {display_path}"
+        note = f"Screenshot captured: {display_path}"
         self.conversation_log.append(note)
         if self.conversation_text is not None:
             widget = self.conversation_text
@@ -1685,7 +1746,7 @@ class App(tk.Tk):
         if speaker not in self._speaker_live_text:
             self._speaker_live_text[speaker] = ""
         if speaker not in self._speaker_history:
-            self._speaker_history[speaker] = []
+            self._speaker_history[speaker] = deque(maxlen=self._speaker_history_maxlen)
         if speaker not in self._speaker_partial:
             self._speaker_partial[speaker] = ""
         if speaker not in self._speaker_segments:
@@ -1707,8 +1768,7 @@ class App(tk.Tk):
             if state.current_start is None:
                 state.current_start = now
             state.last_update = now
-            stamp = time.strftime("%H:%M:%S", time.localtime())
-            self._speaker_partial[speaker] = f"[{stamp}] {candidate_stripped} …"
+            self._speaker_partial[speaker] = f"{candidate_stripped} …"
             return None
 
         if reason == "too_short_dropped":
@@ -1750,8 +1810,9 @@ class App(tk.Tk):
 
         state.current_start = None
         state.last_update = now
-        stamp = time.strftime("%H:%M:%S", time.localtime())
-        self._speaker_history.setdefault(speaker, []).append(f"[{stamp}] {candidate_stripped}")
+        if speaker not in self._speaker_history:
+            self._speaker_history[speaker] = deque(maxlen=self._speaker_history_maxlen)
+        self._speaker_history[speaker].append(candidate_stripped)
         self._speaker_partial[speaker] = ""
         if speaker not in self._speaker_segments:
             self._speaker_segments[speaker] = deque(maxlen=self._speaker_segment_maxlen)
@@ -1807,13 +1868,18 @@ class App(tk.Tk):
 
             formatted_lines: List[str] = []
             for seg in cut_segments:
-                ts = seg.started_at
-                timestamp = time.strftime("%H:%M:%S", time.localtime(ts))
-                label = seg.speaker
                 text = seg.text.strip()
                 if not text:
                     continue
-                formatted_lines.append(f"[{timestamp}] {label}: {text}")
+                formatted_lines.append(
+                    self._format_transcript_line(
+                        seg_label=seg.label,
+                        speaker_name=seg.speaker,
+                        text=text,
+                        normalize_for_llm=True,
+                        timestamp=seg.started_at,
+                    )
+                )
 
             payload = "\n".join(formatted_lines).strip()
             if not payload:
@@ -1835,7 +1901,8 @@ class App(tk.Tk):
             return
 
         self._append_log("Help! dispatched transcript slice to agent")
-        self._run_agent_async(payload_text, screenshots=None)
+        include_context = bool(self.session_context)
+        self._run_agent_async(payload_text, screenshots=None, include_context=include_context)
 
     def destroy(self):
         logger = logging.getLogger("dual_stt")
@@ -2040,8 +2107,7 @@ def stt_to_llm_main(argv: Optional[Sequence[str]] = None) -> int:
                 nonlocal header_printed
                 if header_printed or args.quiet:
                     return
-                stamp = time.strftime("%H:%M:%S")
-                print(f"[{stamp}] === MODEL REPLY ({reason}) ===")
+                print(f"=== MODEL REPLY ({reason}) ===")
                 header_printed = True
 
             def _on_stream(chunk: str) -> None:
@@ -2082,7 +2148,7 @@ def stt_to_llm_main(argv: Optional[Sequence[str]] = None) -> int:
             text = "\n".join(s.strip() for s in segments if s.strip())
             if not text:
                 return
-            print(f"[{time.strftime('%H:%M:%S')}] ({reason}) {text}")
+            print(f"({reason}) {text}")
 
         sink_fn = _send_to_console
 

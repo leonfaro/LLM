@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import audioop
+import httpx
+try:
+    import h2  # noqa: F401
+    _HTTP2_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    _HTTP2_AVAILABLE = False
 import io
 import json
 import logging
+import math
 import os
 import queue
 import shutil
@@ -468,13 +476,16 @@ class EnergySegmenter:
 
     @staticmethod
     def _frame_dbfs(pcm16: bytes) -> float:
-        samples = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32)
-        if samples.size == 0:
+        if not pcm16:
             return -120.0
-        rms = np.sqrt(np.mean(np.square(samples))) + 1e-12
-        db = 20.0 * np.log10(rms / 32768.0)
-        if not np.isfinite(db):
+        try:
+            # width=2 for 16-bit PCM
+            rms = audioop.rms(pcm16, 2)
+        except Exception:
             return -120.0
+        if rms <= 0:
+            return -120.0
+        db = 20.0 * math.log10(rms / 32768.0)
         return float(db)
 
     def _update_threshold(self) -> None:
@@ -541,9 +552,11 @@ class EnergySegmenter:
 
         return segments
 
-    def flush(self) -> Optional[bytes]:
-        """Flush any pending speech segment."""
-        if self._segment_frames and self._started_frames >= self._min_speech_frames:
+    def flush(self, allow_short: bool = False) -> Optional[bytes]:
+        """Flush any pending speech segment.
+        If allow_short is True, finalize even if shorter than min_speech_ms.
+        """
+        if self._segment_frames and (self._started_frames >= self._min_speech_frames or allow_short):
             data = b"".join(self._segment_frames)
             self._segment_frames.clear()
             self._speaking = False
@@ -577,13 +590,24 @@ class HTTPTranscriber(threading.Thread):
         self._flush_flag = threading.Event()
         self._flush_event = threading.Event()
         self._flush_event.set()
+        # Signal when a segment has fully completed (SSE completed / JSON parsed)
+        self._endpoint_event = threading.Event()
+        self._endpoint_event.set()
         self._seg = EnergySegmenter(self.cfg.segment)
         self._api_key = load_openai_api_key()
         self._seg_accum: str = ""
         headers: Dict[str, str] = {}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
-        self._client = httpx.Client(timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=None), headers=headers)
+        limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+        transport = httpx.HTTPTransport(retries=2)
+        self._client = httpx.Client(
+            http2=_HTTP2_AVAILABLE,
+            timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=None),
+            headers=headers,
+            limits=limits,
+            transport=transport,
+        )
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -592,9 +616,14 @@ class HTTPTranscriber(threading.Thread):
         self._flush_flag.set()
 
     def flush_and_wait(self, timeout: float = 1.5) -> bool:
+        # Clear endpoint signal and trigger a forced flush of the current tail
+        self._endpoint_event.clear()
         self._flush_event.clear()
         self._flush_flag.set()
-        return self._flush_event.wait(timeout)
+        # First wait until the worker thread has consumed the flush request
+        self._flush_event.wait(timeout)
+        # Then wait for the server to return a completed transcript
+        return self._endpoint_event.wait(timeout)
 
     def send_frame(self, pcm16: bytes) -> None:
         if not pcm16 or self._stop_event.is_set():
@@ -619,7 +648,7 @@ class HTTPTranscriber(threading.Thread):
         while not self._stop_event.is_set():
             if self._flush_flag.is_set():
                 self._flush_flag.clear()
-                trailing = self._seg.flush()
+                trailing = self._seg.flush(allow_short=True)
                 if trailing:
                     self._transcribe_segment(trailing)
                 self._flush_event.set()
@@ -633,7 +662,7 @@ class HTTPTranscriber(threading.Thread):
             for segment in segments:
                 self._transcribe_segment(segment)
 
-        trailing = self._seg.flush()
+        trailing = self._seg.flush(allow_short=False)
         if trailing:
             self._transcribe_segment(trailing)
         self._flush_event.set()
@@ -661,6 +690,8 @@ class HTTPTranscriber(threading.Thread):
         self._seg_accum = ""
 
         try:
+            # A new request is going out; clear endpoint signal here as well
+            self._endpoint_event.clear()
             if use_sse:
                 HTTP_LOG.info("%s POST %s stream=True model=%s", self.label, self.cfg.endpoint, self.cfg.model)
                 stream_args = {"data": data, "files": files, "headers": {"Accept": "text/event-stream"}}
@@ -711,6 +742,8 @@ class HTTPTranscriber(threading.Thread):
                             self._handle_sse(message)
                     except Exception as exc:
                         HTTP_LOG.error("%s SSE parsing failed: %s", self.label, exc)
+                        # Unblock any waiter; nothing more will arrive for this segment
+                        self._endpoint_event.set()
             else:
                 HTTP_LOG.info("%s POST %s stream=False model=%s", self.label, self.cfg.endpoint, self.cfg.model)
                 response = self._client.post(self.cfg.endpoint, data=data, files=files)
@@ -722,8 +755,11 @@ class HTTPTranscriber(threading.Thread):
                     HTTP_LOG.error("%s transcription error %s: %r", self.label, response.status_code, payload)
                     return
                 self._handle_json_response(response)
+                # JSON path completes synchronously
+                self._endpoint_event.set()
         except Exception as exc:
             HTTP_LOG.error("%s upload failed: %s", self.label, exc)
+            self._endpoint_event.set()
 
     def _handle_sse(self, message: dict) -> None:
         msg_type = message.get("type") or message.get("event") or ""
@@ -759,8 +795,10 @@ class HTTPTranscriber(threading.Thread):
             if final_text:
                 self.on_text(self.label, final_text, {"reason": "endpoint", "language": self.cfg.language})
             self._seg_accum = ""
+            self._endpoint_event.set()
         elif msg_type == "error" or message.get("error"):
             HTTP_LOG.error("%s SSE error: %s", self.label, message)
+            self._endpoint_event.set()
 
     @staticmethod
     def _pcm_to_wav(pcm16: bytes) -> io.BytesIO:

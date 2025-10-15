@@ -165,7 +165,7 @@ async def run_workflow(
     # Build Agent2 input: identical to Agent1 plus Agent1 opener
     agent2_content = list(content)
     if agent1_output:
-        agent2_content.append({"type": "input_text", "text": f"Agent1 opener:\n{agent1_output}"})
+        agent2_content.append({"type": "input_text", "text": "AGENT1_BLUF_START\n" + agent1_output + "\nAGENT1_BLUF_END"})
     agent2_items = [{"role": "user", "content": agent2_content}]
     agent2_result = await Runner.run(
         agent2,
