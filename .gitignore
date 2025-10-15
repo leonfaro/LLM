@@ -1,0 +1,6 @@
+# Ignore Python bytecode cache directories
+__pycache__/
+# Ignore local API key file
+openai_api_key.txt
+# Ignore local context cache
+no_context/
