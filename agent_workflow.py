@@ -162,9 +162,14 @@ async def run_workflow(
         except Exception:
             pass
 
+    # Build Agent2 input: identical to Agent1 plus Agent1 opener
+    agent2_content = list(content)
+    if agent1_output:
+        agent2_content.append({"type": "input_text", "text": f"Agent1 opener:\n{agent1_output}"})
+    agent2_items = [{"role": "user", "content": agent2_content}]
     agent2_result = await Runner.run(
         agent2,
-        input=[{"role": "user", "content": [{"type": "input_text", "text": "Continue"}]}],
+        input=agent2_items,
         session=session,
         run_config=RunConfig(
             trace_metadata={"__trace_source__": "agent-builder", "workflow_id": "wf_codex_cli"},
@@ -178,5 +183,9 @@ async def run_workflow(
             on_stage("Agent2", agent2_output)
         except Exception:
             pass
-    combined_output = "\n".join(part for part in [agent1_output, agent2_output] if part).strip()
-    return {"output_text": combined_output}
+    # Return separate fields; keep output_text as Agent2 for backward compatibility
+    return {
+        "output_text": (agent2_output or "").strip(),
+        "agent1_output": (agent1_output or "").strip(),
+        "agent2_output": (agent2_output or "").strip(),
+    }

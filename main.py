@@ -337,6 +337,10 @@ class App(tk.Tk):
         self.agent_entry: Optional[ScrolledText] = None
         self.agent_send_button: Optional[ttk.Button] = None
         self.agent_screenshot_button: Optional[ttk.Button] = None
+        # Stage UI and state
+        self.agent1_stage_box: Optional[ScrolledText] = None
+        self.agent2_stage_box: Optional[ScrolledText] = None
+        self._latest_stage_outputs: Dict[str, str] = {"Agent1": "", "Agent2": ""}
         self._agent_thread: Optional[threading.Thread] = None
         self._agent_running = False
         self.pending_manual_notes: List[str] = []
@@ -481,16 +485,30 @@ class App(tk.Tk):
 
     def _build_conversation_panel(self, parent):
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(0, weight=3)
-        parent.rowconfigure(1, weight=1)
+        parent.rowconfigure(0, weight=1)   # Agent responses
+        parent.rowconfigure(1, weight=3)   # Conversation
+        parent.rowconfigure(2, weight=1)   # Input
+
+        agents_frame = ttk.Labelframe(parent, text="Agent Responses")
+        agents_frame.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        agents_frame.columnconfigure(0, weight=1)
+        agents_frame.columnconfigure(1, weight=1)
+        a1 = ScrolledText(agents_frame, wrap="word", height=4)
+        a1.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
+        a2 = ScrolledText(agents_frame, wrap="word", height=4)
+        a2.grid(row=0, column=1, sticky="nsew", padx=(2, 0))
+        self.agent1_stage_box = a1
+        self.agent2_stage_box = a2
+        self._write_text(a1, "", newline=False)
+        self._write_text(a2, "", newline=False)
 
         text = ScrolledText(parent, wrap="word", height=8)
-        text.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        text.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
         self.conversation_text = text
         self._write_text(text, "", newline=False)
 
         input_frame = ttk.Frame(parent)
-        input_frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
+        input_frame.grid(row=2, column=0, sticky="nsew", padx=4, pady=(0, 4))
         input_frame.columnconfigure(0, weight=1)
         input_frame.rowconfigure(0, weight=1)
 
@@ -1013,7 +1031,16 @@ class App(tk.Tk):
             def _ui():
                 cleaned = force_english_text(text)
                 if cleaned:
-                    self._append_conversation_line(stage, cleaned)
+                    # cache latest stage output
+                    self._latest_stage_outputs[stage] = cleaned
+                    # show it immediately in the dedicated box
+                    widget = self.agent1_stage_box if stage == "Agent1" else self.agent2_stage_box if stage == "Agent2" else None
+                    if widget is not None:
+                        widget.configure(state=tk.NORMAL)
+                        widget.delete("1.0", tk.END)
+                        widget.insert(tk.END, cleaned)
+                        widget.see(tk.END)
+                        widget.configure(state=tk.DISABLED)
                 self._append_log(f"{stage} response ready")
 
             self.after(0, _ui)
@@ -1050,18 +1077,34 @@ class App(tk.Tk):
             self.agent_send_button.configure(state=tk.NORMAL)
         if getattr(self, "help_btn", None):
             self.help_btn.configure(state=tk.NORMAL)
-        text = ""
+        # Pull staged outputs; fall back to result fields if necessary
+        a1 = self._latest_stage_outputs.get("Agent1", "")
+        a2 = self._latest_stage_outputs.get("Agent2", "")
         if isinstance(result, dict):
-            raw = result.get("output_text")
-            if isinstance(raw, str):
-                text = raw
-        text = force_english_text(text)
-        if not text:
+            if not a1:
+                raw1 = result.get("agent1_output")
+                a1 = force_english_text(raw1) if isinstance(raw1, str) else ""
+            if not a2:
+                raw2 = result.get("agent2_output") or result.get("output_text")
+                a2 = force_english_text(raw2) if isinstance(raw2, str) else ""
+
+        if a1:
+            self._append_conversation_line("Agent1", a1)
+        if a2:
+            self._append_conversation_line("Agent2", a2)
+        if not a1 and not a2:
             self._append_conversation_line("Agent", "Agent returned no content.")
             self._append_log("Agent response empty")
             return
-        self._append_conversation_line("Agent", text)
-        self._append_log("Agent response ready")
+        # Clear stage boxes and cache
+        for widget in (self.agent1_stage_box, self.agent2_stage_box):
+            if widget is not None:
+                widget.configure(state=tk.NORMAL)
+                widget.delete("1.0", tk.END)
+                widget.configure(state=tk.DISABLED)
+        self._latest_stage_outputs["Agent1"] = ""
+        self._latest_stage_outputs["Agent2"] = ""
+        self._append_log("Agent responses appended to Conversation")
 
     def _handle_agent_failure(self, exc: Exception) -> None:
         self._agent_running = False
